@@ -161,13 +161,13 @@ function update(dt) {
 
   boost = Math.max(0, boost - dt);
   const offroad = Math.abs(playerX) > 1;
-  let top = MAX * (boost > 0 ? 1.6 : 1) * (offroad ? 0.5 : 1);
+  let top = MAX * (boost > 0 ? 1.6 : 1) * (offroad ? 0.2 : 1); // 잔디: 최고속도 대폭 감소
 
   if (state === 'finished') speed += BRAKE * 0.6 * dt;
   else if (keys.ArrowUp) speed += ACCEL * (boost > 0 ? 2.5 : 1) * dt;
   else if (keys.ArrowDown) speed += BRAKE * dt;
   else speed += DECEL * dt;
-  if (speed > top) speed = Math.max(top, speed + OVER_DECEL * dt);
+  if (speed > top) speed = Math.max(top, speed + OVER_DECEL * (offroad ? 2.5 : 1) * dt); // 잔디 진입 시 급감속
   speed = Math.max(0, speed);
   pos += speed * dt;
 
