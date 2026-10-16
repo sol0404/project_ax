@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rush Line</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #fallback { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 12px; padding: 16px; background: #1d5cc0; color: #fff; font: 18px system-ui, sans-serif; text-align: center; }
+  #fallback b { font-size: 40px; color: #ffd000; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="fallback">
+  <b>RUSH LINE</b>
+  <div>게임이 실행되지 않았습니다.</div>
+  <div>파일을 PC에 저장한 뒤 <u>크롬</u> 또는 <u>엣지</u>로 열어 주세요.<br>(메신저 미리보기, 휴대폰, 인터넷 익스플로러에서는 동작하지 않습니다)</div>
+  <div id="errmsg" style="font-size:13px;opacity:.8"></div>
+</div>
+<script>
+  window.onerror = function (msg, src, line) {
+    document.getElementById('fallback').style.display = 'flex';
+    document.getElementById('errmsg').textContent = '오류: ' + msg + ' (line ' + line + ')';
+  };
+</script>
+<script>
+// ===== 기본 설정 =====
+document.getElementById('fallback').style.display = 'none';
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let W, H;
+function resize() { W = cv.width = innerWidth; H = cv.height = innerHeight; }
+addEventListener('resize', resize); resize();
+
+const SEG = 200;            // 세그먼트 길이
+const ROAD = 2000;          // 도로 반폭
+const CAM_H = 1000;         // 카메라 높이
+const DRAW = 300;           // 그릴 세그먼트 수
+const LANES = 3, RUMBLE = 3;
+const MAX = 12000;          // 기본 최고속도 (units/s)
+const ACCEL = MAX / 4, BRAKE = -MAX * 1.2, DECEL = -MAX / 6, OVER_DECEL = -MAX / 1.5;
+const CENTRI = 0.2;
+const CAM_DEPTH = 1 / Math.tan(50 * Math.PI / 180); // FOV 100도
+const PZ = CAM_H * CAM_DEPTH;                         // 카메라 ~ 차 앞범퍼 거리
+const PLAYER_W = 700;
+const FINISH_SEG = 2700;
+const FINISH_Z = FINISH_SEG * SEG;
+const CAR_COLORS = ['#d33', '#36c', '#eee', '#f90', '#6a4', '#a3c', '#222'];
+
+function mulberry(a) {
+  return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+}
+
+// ===== 트랙 =====
+let segs = [];
+function addSeg(curve) {
+  const n = segs.length;
+  segs.push({ i: n, z1: n * SEG, z2: (n + 1) * SEG, curve, light: Math.floor(n / RUMBLE) % 2 === 0, p1: {}, p2: {}, frame: -1 });
+}
+const ease = (a, b, p) => a + (b - a) * (-Math.cos(p * Math.PI) / 2 + 0.5);
+function addRoad(enter, hold, leave, curve) {
+  for (let i = 0; i < enter; i++) addSeg(ease(0, curve, i / enter));
+  for (let i = 0; i < hold; i++) addSeg(curve);
+  for (let i = 0; i < leave; i++) addSeg(ease(curve, 0, i / leave));
+}
+function buildTrack() {
+  segs = [];
+  const r = mulberry(7);
+  addRoad(0, 80, 0, 0);
+  const curves = [-4, -3, -2, 0, 0, 2, 3, 4];
+  while (segs.length < FINISH_SEG - 120) {
+    addRoad(20 + (r() * 30 | 0), 30 + (r() * 80 | 0), 20 + (r() * 30 | 0), curves[r() * curves.length | 0]);
+  }
+  addRoad(0, FINISH_SEG + DRAW + 200 - segs.length, 0, 0); // 결승 직선
+}
+
+// ===== 장애물 / 아이템 =====
+let objs = [];
+function buildObjs() {
+  objs = [];
+  const r = mulberry(42), lanes = [-2 / 3, 0, 2 / 3];
+  for (let s = 90; s < FINISH_SEG - 30; s += 16 + (r() * 22 | 0)) {
+    if (r() < 0.45) {
+      const n = r() < 0.4 ? 2 : 1, l = r() * 3 | 0;
+      for (let j = 0; j < n; j++)
+        objs.push({ type: 'cone', z: s * SEG, x: lanes[(l + j) % 3] + (r() - 0.5) * 0.1, w: 280 });
+    } else {
+      objs.push({ type: 'car', z: s * SEG, x: lanes[r() * 3 | 0], w: 750,
+        speed: MAX * (0.25 + r() * 0.2), color: CAR_COLORS[r() * CAR_COLORS.length | 0] });
+    }
+  }
+  for (let s = 200; s < FINISH_SEG - 100; s += 230 + (r() * 60 | 0))
+    objs.push({ type: 'boost', z: s * SEG + SEG / 2, x: lanes[r() * 3 | 0], w: 420 });
+  objs.push({ type: 'gate', z: FINISH_Z, x: 0, w: 0, hit: false, deco: true });
+  objs.forEach(o => o.pz = o.z);
+}
+
+// ===== 상태 =====
+let state, pos, speed, playerX, time, crashes, item, boost, boostFx, shake, hitFlash, pickFlash,
+    invuln, steerVis, skyOff, countdown, frame = 0, clock = 0, best = null;
+try { best = parseFloat(localStorage.getItem('rushline-best')) || null; } catch (e) {}
+
+function reset() {
+  buildObjs();
+  state = 'ready'; pos = 0; speed = 0; playerX = 0; time = 0; crashes = 0; item = false;
+  boost = 0; boostFx = 0; shake = 0; hitFlash = 0; pickFlash = 0; invuln = 0; steerVis = 0; skyOff = 0; countdown = 0;
+}
+buildTrack(); reset();
+
+// ===== 입력 =====
+const keys = {};
+addEventListener('keydown', e => {
+  if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Space'].includes(e.code)) e.preventDefault();
+  keys[e.code] = true;
+  if (e.repeat) return;
+  if (e.code === 'Enter' || e.code === 'Space') {
+    if (state === 'ready') { state = 'count'; countdown = 3; return; }
+    if (state === 'finished' && e.code === 'Enter') { reset(); return; }
+  }
+  if (e.code === 'Space' && state === 'race' && item) {
+    item = false; boost = 2; speed = Math.max(speed, MAX * 1.15); shake = Math.max(shake, 0.25);
+  }
+  if (e.code === 'KeyR') reset();
+});
+addEventListener('keyup', e => { keys[e.code] = false; });
+
+const segAt = z => segs[Math.max(0, Math.min(segs.length - 1, Math.floor(z / SEG)))];
+
+// ===== 업데이트 =====
+function update(dt) {
+  clock += dt;
+  shake = Math.max(0, shake - dt); hitFlash = Math.max(0, hitFlash - dt);
+  pickFlash = Math.max(0, pickFlash - dt); invuln = Math.max(0, invuln - dt);
+  boostFx += ((boost > 0 ? 1 : 0) - boostFx) * Math.min(1, dt * 5);
+
+  const target = (keys.ArrowRight ? 1 : 0) - (keys.ArrowLeft ? 1 : 0);
+  steerVis += (target - steerVis) * Math.min(1, dt * 8);
+
+  if (state === 'count') {
+    countdown -= dt;
+    if (countdown <= 0) state = 'race';
+    return;
+  }
+  if (state !== 'race' && state !== 'finished') return;
+
+  const prevPos = pos;
+  const pseg = segAt(pos + PZ);
+  const pct = speed / MAX;
+  const dx = dt * 2 * Math.min(pct, 1.2);
+
+  if (state === 'race') {
+    playerX += target * dx;
+    time += dt;
+  }
+  playerX -= dx * pct * pseg.curve * CENTRI;
+  playerX = Math.max(-2.5, Math.min(2.5, playerX));
+  skyOff += pseg.curve * pct * dt * 60;
+
+  boost = Math.max(0, boost - dt);
+  const offroad = Math.abs(playerX) > 1;
+  let top = MAX * (boost > 0 ? 1.6 : 1) * (offroad ? 0.5 : 1);
+
+  if (state === 'finished') speed += BRAKE * 0.6 * dt;
+  else if (keys.ArrowUp) speed += ACCEL * (boost > 0 ? 2.5 : 1) * dt;
+  else if (keys.ArrowDown) speed += BRAKE * dt;
+  else speed += DECEL * dt;
+  if (speed > top) speed = Math.max(top, speed + OVER_DECEL * dt);
+  speed = Math.max(0, speed);
+  pos += speed * dt;
+
+  for (const o of objs) {
+    o.pz = o.z;
+    if (o.type === 'car') o.z += o.speed * dt;
+  }
+
+  // 충돌: 이번 프레임에 상대 z가 앞→뒤로 넘어간 오브젝트 중 x가 겹치는 것
+  if (state === 'race') {
+    const z0 = prevPos + PZ, z1 = pos + PZ;
+    for (const o of objs) {
+      if (o.hit || o.deco) continue;
+      const r0 = o.pz - z0, r1 = o.z - z1;
+      if (r0 >= 0 && r1 < 0 && Math.abs(o.x - playerX) < (o.w / 2 + PLAYER_W / 2) / ROAD) {
+        if (o.type === 'boost') {
+          if (!item) { item = true; o.hit = true; pickFlash = 0.4; }
+        } else if (invuln <= 0) {
+          crashes++; speed *= 0.3; shake = 0.6; hitFlash = 0.4; invuln = 0.5;
+          if (o.type === 'cone') o.hit = true;
+          else { speed = Math.min(speed, o.speed * 0.8); pos = o.z - PZ - SEG * 0.3; }
+        }
+      }
+    }
+    if (pos + PZ >= FINISH_Z) {
+      state = 'finished';
+      if (best === null || time < best) {
+        best = time;
+        try { localStorage.setItem('rushline-best', String(best)); } catch (e) {}
+      }
+    }
+  }
+}
+
+// ===== 렌더 =====
+let cd, cy;
+function project(p, camX, cz) {
+  p.cz = cz;
+  p.scale = cd / cz;
+  p.x = Math.round(W / 2 - p.scale * camX * W / 2);
+  p.y = Math.round(cy + p.scale * CAM_H * H / 2);
+  p.w = Math.round(p.scale * ROAD * W / 2);
+}
+function poly(col, ...pts) {
+  ctx.fillStyle = col; ctx.beginPath(); ctx.moveTo(pts[0], pts[1]);
+  for (let i = 2; i < pts.length; i += 2) ctx.lineTo(pts[i], pts[i + 1]);
+  ctx.closePath(); ctx.fill();
+}
+
+function drawSeg(s) {
+  const a = s.p1, b = s.p2, L = s.light;
+  ctx.fillStyle = L ? '#18b018' : '#0e980e';
+  ctx.fillRect(-40, b.y, W + 80, a.y - b.y);
+  const r1 = a.w / 6, r2 = b.w / 6;
+  const rc = L ? '#fff' : '#d22';
+  poly(rc, a.x - a.w - r1, a.y, a.x - a.w, a.y, b.x - b.w, b.y, b.x - b.w - r2, b.y);
+  poly(rc, a.x + a.w + r1, a.y, a.x + a.w, a.y, b.x + b.w, b.y, b.x + b.w + r2, b.y);
+  poly(L ? '#6c6c6c' : '#646464', a.x - a.w, a.y, a.x + a.w, a.y, b.x + b.w, b.y, b.x - b.w, b.y);
+
+  if (s.i >= FINISH_SEG && s.i < FINISH_SEG + 3) {
+    const n = 10;
+    for (let c = 0; c < n; c++) {
+      const f0 = c / n * 2 - 1, f1 = (c + 1) / n * 2 - 1;
+      poly((c + s.i) % 2 ? '#fff' : '#111',
+        a.x + a.w * f0, a.y, a.x + a.w * f1, a.y, b.x + b.w * f1, b.y, b.x + b.w * f0, b.y);
+    }
+  } else if (L) {
+    const l1 = a.w / 32, l2 = b.w / 32;
+    for (let k = 1; k < LANES; k++) {
+      const x1 = a.x - a.w + a.w * 2 / LANES * k, x2 = b.x - b.w + b.w * 2 / LANES * k;
+      poly('#fff', x1 - l1 / 2, a.y, x1 + l1 / 2, a.y, x2 + l2 / 2, b.y, x2 - l2 / 2, b.y);
+    }
+  }
+}
+
+function drawCone(x, y, w) {
+  const h = w * 1.4, hw = f => w * 0.4 - w * 0.32 * f, yy = f => y - h * 0.1 - (h * 0.9) * f;
+  ctx.fillStyle = '#222'; ctx.fillRect(x - w / 2, y - h * 0.1, w, h * 0.1);
+  poly('#ff7a00', x - hw(0), yy(0), x - hw(1), yy(1), x + hw(1), yy(1), x + hw(0), yy(0));
+  poly('#fff', x - hw(0.35), yy(0.35), x - hw(0.55), yy(0.55), x + hw(0.55), yy(0.55), x + hw(0.35), yy(0.35));
+}
+
+function drawCar(x, y, w, col) {
+  const h = w * 0.62;
+  ctx.fillStyle = 'rgba(0,0,0,.35)';
+  ctx.beginPath(); ctx.ellipse(x, y, w * 0.58, h * 0.1, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#111';
+  ctx.fillRect(x - w * 0.46, y - h * 0.22, w * 0.18, h * 0.22);
+  ctx.fillRect(x + w * 0.28, y - h * 0.22, w * 0.18, h * 0.22);
+  poly(col, x - w * 0.38, y - h * 0.6, x - w * 0.3, y - h, x + w * 0.3, y - h, x + w * 0.38, y - h * 0.6);
+  poly('#1c2b3c', x - w * 0.32, y - h * 0.63, x - w * 0.26, y - h * 0.93, x + w * 0.26, y - h * 0.93, x + w * 0.32, y - h * 0.63);
+  ctx.fillStyle = col; ctx.fillRect(x - w / 2, y - h * 0.64, w, h * 0.46);
+  ctx.fillStyle = 'rgba(0,0,0,.25)'; ctx.fillRect(x - w / 2, y - h * 0.26, w, h * 0.08);
+  ctx.fillStyle = '#ff2020';
+  ctx.fillRect(x - w * 0.46, y - h * 0.55, w * 0.18, h * 0.1);
+  ctx.fillRect(x + w * 0.28, y - h * 0.55, w * 0.18, h * 0.1);
+  ctx.fillStyle = '#eee'; ctx.fillRect(x - w * 0.1, y - h * 0.44, w * 0.2, h * 0.1);
+}
+
+function drawBolt(cx, cy2, s, col) {
+  const p = [[0.1, -0.5], [-0.3, 0.05], [-0.02, 0.05], [-0.12, 0.5], [0.3, -0.08], [0.02, -0.08]];
+  ctx.fillStyle = col; ctx.beginPath();
+  p.forEach(([a, b], i) => i ? ctx.lineTo(cx + a * s, cy2 + b * s) : ctx.moveTo(cx + a * s, cy2 + b * s));
+  ctx.closePath(); ctx.fill();
+}
+
+function drawBoostBox(x, y, w) {
+  const s = w, by = y - s * 0.3 - Math.sin(clock * 5) * s * 0.12;
+  ctx.fillStyle = 'rgba(0,0,0,.3)';
+  ctx.beginPath(); ctx.ellipse(x, y, s * 0.45, s * 0.08, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = 'rgba(255,230,0,.25)';
+  ctx.beginPath(); ctx.arc(x, by - s / 2, s * 0.85, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#ffd000'; ctx.fillRect(x - s / 2, by - s, s, s);
+  ctx.strokeStyle = '#a06a00'; ctx.lineWidth = Math.max(1, s * 0.06); ctx.strokeRect(x - s / 2, by - s, s, s);
+  drawBolt(x, by - s / 2, s * 0.75, '#3a2000');
+}
+
+function drawGate(x, y, roadW, scale) {
+  const ph = scale * 3200 * W / 2, pw = Math.max(2, scale * 120 * W / 2), bh = scale * 600 * W / 2;
+  const lx = x - roadW * 1.25, rx = x + roadW * 1.25;
+  ctx.fillStyle = '#ccc';
+  ctx.fillRect(lx - pw / 2, y - ph, pw, ph); ctx.fillRect(rx - pw / 2, y - ph, pw, ph);
+  const n = 16, cw = (rx - lx) / n;
+  for (let r = 0; r < 2; r++) for (let c = 0; c < n; c++) {
+    ctx.fillStyle = (r + c) % 2 ? '#111' : '#fff';
+    ctx.fillRect(lx + c * cw, y - ph + r * bh / 2, cw + 1, bh / 2 + 1);
+  }
+  if (bh > 12) {
+    ctx.fillStyle = '#e22'; ctx.fillRect(x - roadW * 0.45, y - ph - bh * 0.1, roadW * 0.9, bh * 1.2);
+    ctx.fillStyle = '#fff'; ctx.font = `bold ${Math.round(bh * 0.8)}px system-ui,sans-serif`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('FINISH', x, y - ph + bh / 2);
+  }
+}
+
+function render() {
+  frame++;
+  cd = CAM_DEPTH * (1 - 0.18 * boostFx); // 부스트 중 FOV 확대
+  cy = H * 0.42;
+  ctx.save();
+  const sh = shake * 30 + boostFx * 4;
+  ctx.translate((Math.random() - 0.5) * sh, (Math.random() - 0.5) * sh);
+
+  // 하늘과 산
+  const g = ctx.createLinearGradient(0, 0, 0, cy);
+  g.addColorStop(0, '#1d5cc0'); g.addColorStop(1, '#a8d8ff');
+  ctx.fillStyle = g; ctx.fillRect(-40, -40, W + 80, cy + 41);
+  ctx.fillStyle = '#fff6c0'; ctx.beginPath(); ctx.arc(W * 0.78 - skyOff * 0.2 % W, cy * 0.35, 30, 0, Math.PI * 2); ctx.fill();
+  const hills = (col, off, amp, base) => {
+    ctx.fillStyle = col; ctx.beginPath(); ctx.moveTo(-40, cy);
+    for (let x = -40; x <= W + 40; x += 10) {
+      const t = x + off;
+      ctx.lineTo(x, cy - base - Math.sin(t * 0.005) * amp - Math.sin(t * 0.013 + 1) * amp * 0.5);
+    }
+    ctx.lineTo(W + 40, cy); ctx.fill();
+  };
+  hills('#6c7fae', skyOff, 35, 45);
+  hills('#3f7d4a', skyOff * 1.8, 18, 15);
+  ctx.fillStyle = '#0e980e'; ctx.fillRect(-40, cy, W + 80, H - cy + 40);
+
+  // 도로
+  const base = segAt(pos), basePct = (pos % SEG) / SEG;
+  let x = 0, dx = -(base.curve * basePct), maxy = H + 40;
+  for (let n = 0; n < DRAW; n++) {
+    const s = segs[base.i + n];
+    if (!s) break;
+    project(s.p1, playerX * ROAD - x, s.z1 - pos);
+    project(s.p2, playerX * ROAD - x - dx, s.z2 - pos);
+    x += dx; dx += s.curve;
+    s.frame = frame;
+    if (s.p1.cz <= cd || s.p2.y >= s.p1.y || s.p2.y >= maxy) continue;
+    drawSeg(s);
+    maxy = s.p2.y;
+  }
+
+  // 스프라이트 (멀리서부터)
+  const vis = [];
+  for (const o of objs) {
+    if (o.hit) continue;
+    const rel = o.z - pos;
+    if (rel < PZ * 0.6 || rel > DRAW * SEG * 0.9) continue;
+    const s = segAt(o.z);
+    if (s.frame !== frame) continue;
+    const f = (o.z - s.z1) / SEG;
+    vis.push({ o, rel, s, f });
+  }
+  vis.sort((a, b) => b.rel - a.rel);
+  for (const { o, rel, s, f } of vis) {
+    const scale = cd / rel;
+    const rx = s.p1.x + (s.p2.x - s.p1.x) * f, ry = s.p1.y + (s.p2.y - s.p1.y) * f;
+    const sx = rx + scale * o.x * ROAD * W / 2, sw = scale * o.w * W / 2;
+    if (o.type === 'cone') drawCone(sx, ry, sw);
+    else if (o.type === 'car') drawCar(sx, ry, sw, o.color);
+    else if (o.type === 'boost') drawBoostBox(sx, ry, sw);
+    else if (o.type === 'gate') drawGate(rx, ry, scale * ROAD * W / 2, scale);
+  }
+
+  // 스피드 라인
+  const pct = speed / MAX;
+  if (pct > 0.3) {
+    const n = Math.floor((pct - 0.3) * 40 * (1 + boostFx * 1.5));
+    const R = Math.hypot(W, H) / 2;
+    ctx.strokeStyle = `rgba(255,255,255,${0.25 + boostFx * 0.35})`;
+    ctx.lineWidth = 2 + boostFx * 2;
+    ctx.beginPath();
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const r0 = R * (0.45 + Math.random() * 0.35), len = (40 + Math.random() * 120) * pct * (1 + boostFx);
+      const c = Math.cos(a), sn = Math.sin(a);
+      ctx.moveTo(W / 2 + c * r0, cy + sn * r0); ctx.lineTo(W / 2 + c * (r0 + len), cy + sn * (r0 + len));
+    }
+    ctx.stroke();
+  }
+
+  drawCockpit();
+  ctx.restore();
+
+  if (hitFlash > 0) { ctx.fillStyle = `rgba(255,0,0,${hitFlash * 0.8})`; ctx.fillRect(0, 0, W, H); }
+  if (pickFlash > 0) { ctx.fillStyle = `rgba(255,220,0,${pickFlash * 0.6})`; ctx.fillRect(0, 0, W, H); }
+  drawHUD();
+}
+
+function drawCockpit() {
+  const dh = H * 0.24;
+  ctx.fillStyle = '#1a1b20';
+  ctx.beginPath(); ctx.moveTo(-40, H + 40); ctx.lineTo(-40, H - dh * 0.8);
+  ctx.quadraticCurveTo(W / 2, H - dh * 1.25, W + 40, H - dh * 0.8); ctx.lineTo(W + 40, H + 40); ctx.fill();
+  ctx.strokeStyle = '#34353d'; ctx.lineWidth = 4;
+  ctx.beginPath(); ctx.moveTo(-40, H - dh * 0.8); ctx.quadraticCurveTo(W / 2, H - dh * 1.25, W + 40, H - dh * 0.8); ctx.stroke();
+
+  // 아날로그 속도계
+  const gx = W * 0.14, gy = H - dh * 0.45, gr = dh * 0.36;
+  ctx.fillStyle = '#0b0b0e'; ctx.beginPath(); ctx.arc(gx, gy, gr, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = '#555'; ctx.lineWidth = 3; ctx.stroke();
+  const a0 = Math.PI * 0.75, a1 = Math.PI * 2.25;
+  ctx.strokeStyle = '#aaa'; ctx.lineWidth = 2;
+  for (let i = 0; i <= 8; i++) {
+    const a = a0 + (a1 - a0) * i / 8;
+    ctx.beginPath(); ctx.moveTo(gx + Math.cos(a) * gr * 0.8, gy + Math.sin(a) * gr * 0.8);
+    ctx.lineTo(gx + Math.cos(a) * gr * 0.95, gy + Math.sin(a) * gr * 0.95); ctx.stroke();
+  }
+  const kmh = speed / MAX * 260, na = a0 + (a1 - a0) * Math.min(kmh / 450, 1);
+  ctx.strokeStyle = boost > 0 ? '#ffd000' : '#ff3b3b'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(gx, gy); ctx.lineTo(gx + Math.cos(na) * gr * 0.85, gy + Math.sin(na) * gr * 0.85); ctx.stroke();
+
+  // 핸들
+  const R = Math.min(W * 0.2, H * 0.3), wx = W / 2, wy = H + R * 0.25;
+  ctx.save(); ctx.translate(wx, wy); ctx.rotate(steerVis * 0.7);
+  ctx.lineCap = 'round';
+  ctx.strokeStyle = '#1a1a1a'; ctx.lineWidth = R * 0.12;
+  ctx.beginPath(); ctx.moveTo(-R, 0); ctx.lineTo(R, 0); ctx.moveTo(0, 0); ctx.lineTo(0, R); ctx.stroke();
+  ctx.strokeStyle = '#0e0e0e'; ctx.lineWidth = R * 0.16;
+  ctx.beginPath(); ctx.arc(0, 0, R, 0, Math.PI * 2); ctx.stroke();
+  ctx.strokeStyle = '#e33';
+  ctx.beginPath(); ctx.arc(0, 0, R, -Math.PI / 2 - 0.07, -Math.PI / 2 + 0.07); ctx.stroke();
+  ctx.fillStyle = '#222'; ctx.beginPath(); ctx.arc(0, 0, R * 0.26, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#e33'; ctx.beginPath(); ctx.arc(0, 0, R * 0.07, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+
+const fmt = t => {
+  const m = Math.floor(t / 60), s = t - m * 60;
+  return `${String(m).padStart(2, '0')}:${s.toFixed(2).padStart(5, '0')}`;
+};
+
+function panel(x, y, w, h) { ctx.fillStyle = 'rgba(0,0,0,.5)'; ctx.fillRect(x, y, w, h); }
+function text(str, x, y, size, col = '#fff', align = 'left') {
+  ctx.font = `bold ${size}px system-ui, sans-serif`; ctx.fillStyle = col;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.fillText(str, x, y);
+}
+
+function drawHUD() {
+  // 좌상단: 속도
+  panel(16, 16, 190, 70);
+  text(String(Math.round(speed / MAX * 260)), 30, 50, 40, boost > 0 ? '#ffd000' : '#fff');
+  text('km/h', 130, 58, 16, '#bbb');
+  if (Math.abs(playerX) > 1 && state === 'race') text('OFF ROAD', 30, 100, 16, '#ff8a3a');
+
+  // 상단 중앙: 진행도 + 시간/충돌
+  const pw = Math.min(W * 0.4, 420), px = W / 2 - pw / 2;
+  const prog = Math.min(1, (pos + PZ) / FINISH_Z);
+  panel(px - 10, 16, pw + 20, 86);
+  ctx.fillStyle = '#333'; ctx.fillRect(px, 28, pw, 14);
+  ctx.fillStyle = '#3bd16f'; ctx.fillRect(px, 28, pw * prog, 14);
+  text(`${Math.floor(prog * 100)}%`, px + pw, 52, 13, '#bbb', 'right');
+  text(`TIME ${fmt(time)}`, W / 2, 72, 22, '#fff', 'center');
+  text(`CRASH ${crashes}`, px, 90, 14, crashes ? '#ff7070' : '#bbb');
+  if (best !== null) text(`BEST ${fmt(best)}`, px + pw, 90, 14, '#bbb', 'right');
+
+  // 우상단: 아이템 슬롯
+  const sx = W - 96;
+  panel(sx - 4, 16, 84, 96);
+  ctx.strokeStyle = item ? '#ffd000' : '#555'; ctx.lineWidth = 3; ctx.strokeRect(sx + 6, 24, 64, 64);
+  if (item) drawBolt(sx + 38, 56, 50, '#ffd000');
+  text(boost > 0 ? 'BOOST!' : 'SPACE', sx + 38, 100, 12, boost > 0 ? '#ffd000' : '#bbb', 'center');
+  if (boost > 0) { ctx.fillStyle = '#ffd000'; ctx.fillRect(sx + 6, 90, 64 * boost / 2, 3); }
+
+  // 오버레이
+  if (state === 'ready') {
+    panel(0, H * 0.25, W, H * 0.4);
+    text('RUSH LINE', W / 2, H * 0.33, 64, '#ffd000', 'center');
+    text('← → 조향   ↑ 가속   ↓ 감속   Space 부스터', W / 2, H * 0.43, 20, '#fff', 'center');
+    text('콘과 느린 차를 피해 결승선까지 최대한 빨리!', W / 2, H * 0.49, 16, '#ccc', 'center');
+    if (Math.floor(clock * 2) % 2 === 0) text('Enter 또는 Space로 시작', W / 2, H * 0.58, 24, '#fff', 'center');
+  } else if (state === 'count') {
+    text(String(Math.ceil(countdown)), W / 2, H * 0.35, 120, '#fff', 'center');
+  } else if (state === 'race' && time < 0.8) {
+    text('GO!', W / 2, H * 0.35, 120, '#3bd16f', 'center');
+  } else if (state === 'finished') {
+    panel(0, H * 0.22, W, H * 0.42);
+    text('FINISH!', W / 2, H * 0.3, 64, '#ffd000', 'center');
+    text(`기록 ${fmt(time)}`, W / 2, H * 0.4, 36, '#fff', 'center');
+    text(`충돌 ${crashes}회   ·   최고 기록 ${fmt(best)}${best === time ? '  NEW!' : ''}`, W / 2, H * 0.48, 20, '#ccc', 'center');
+    text('Enter 또는 R로 다시 달리기', W / 2, H * 0.57, 22, '#fff', 'center');
+  }
+}
+
+// ===== 루프 =====
+let last = performance.now();
+function loop(t) {
+  const dt = Math.min(0.05, (t - last) / 1000); last = t;
+  update(dt); render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
